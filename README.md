@@ -53,7 +53,7 @@ Orchestrator	Multi-market controller + latency simulation
 Serializer	Saves snapshot of system state (accounts, markets, treasury)
 ⚙️ Setup & Run
 1. Clone & Install
-git clone https://github.com/xenos-labs/xenos-perp-engine.git
+git clone https://github.com/4nt30n1/xenos-prototype/tree/main
 cd xenos-perp-engine
 npm install typescript ts-node
 
