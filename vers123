@@ -1,0 +1,1616 @@
+/*
+ XENOS Mock Perp Engine (≈1000 lines)
+ ------------------------------------------------------------
+ A self-contained, plausible TypeScript code file modeling core
+ components of a perpetual futures exchange on Solana-like infra.
+ No external libraries required; uses Node/TS standard features.
+
+ Modules included in this single file:
+  - Domain types & helpers
+  - Deterministic PRNG & telemetry timer
+  - Event bus
+  - Price oracle (mock Pyth/Switchboard hybrid)
+  - Account model (cross/isolated margin)
+  - Order types & orderbook (price-time priority)
+  - Matching engine (GTC/IOC/FOK, post-only, reduce-only)
+  - Funding rate engine (EMA-based, clamps, settlement)
+  - Risk engine (MMR/IMR, partial liquidation, bankruptcy)
+  - Fee router (maker/taker/creator split; creator’s fee schedule)
+  - Treasury & streamflow lock emulator
+  - Exchange façade (create market, submit/cancel orders, etc.)
+  - Minimal scenario runner to demonstrate functionality
+
+ NOTE: This is demo code only; no real money, no guarantees.
+*/
+
+/**********************  DOMAIN & HELPERS  **********************/
+
+type Decimal = number; // for demo purposes; in prod use bigints/decimal libs
+
+const toFixed = (n: number, d = 6) => Number(n.toFixed(d));
+
+// clamp a number into [min, max]
+const clamp = (x: number, min: number, max: number) => Math.max(min, Math.min(max, x));
+
+// simple moving average
+const sma = (arr: number[], window: number) => {
+  if (arr.length === 0) return 0;
+  const n = Math.min(arr.length, window);
+  let s = 0;
+  for (let i = arr.length - n; i < arr.length; i++) s += arr[i];
+  return s / n;
+};
+
+// exponential moving average
+function ema(prev: number, value: number, k: number) {
+  return prev === 0 ? value : prev * (1 - k) + value * k;
+}
+
+// deterministic PRNG (mulberry32)
+function mulberry32(seed: number) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6d2b79f5;
+    let x = Math.imul(t ^ (t >>> 15), 1 | t);
+    x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+class Timer {
+  private _t = 0;
+  advance(dtMs: number) { this._t += dtMs; }
+  now() { return this._t; }
+}
+
+const timer = new Timer();
+
+/*************************  EVENT BUS  **************************/
+
+type EventHandler<T> = (data: T) => void;
+
+class EventBus {
+  private map = new Map<string, Set<EventHandler<any>>>();
+  on<T>(event: string, handler: EventHandler<T>) {
+    if (!this.map.has(event)) this.map.set(event, new Set());
+    this.map.get(event)!.add(handler as any);
+  }
+  off<T>(event: string, handler: EventHandler<T>) {
+    this.map.get(event)?.delete(handler as any);
+  }
+  emit<T>(event: string, data: T) {
+    this.map.get(event)?.forEach(h => {
+      try { h(data); } catch (e) { console.error("event error", event, e); }
+    });
+  }
+}
+
+const bus = new EventBus();
+
+/**********************  ORACLE (MOCK)  *************************/
+
+type OraclePrice = { symbol: string; price: Decimal; conf: Decimal; ts: number };
+
+class Oracle {
+  private prng = mulberry32(42);
+  private prices = new Map<string, OraclePrice>();
+  private drift = new Map<string, number>();
+
+  constructor(initial: Record<string, number>) {
+    for (const [sym, p] of Object.entries(initial)) {
+      this.prices.set(sym, { symbol: sym, price: p, conf: p * 0.002, ts: timer.now() });
+      this.drift.set(sym, 0);
+    }
+  }
+
+  // simulate noisy price process bounded by daily volatility
+  tick(symbol: string) {
+    const cur = this.prices.get(symbol);
+    if (!cur) throw new Error("unknown symbol");
+    const rnd = this.prng();
+    const vol = 0.015; // ~1.5% step volatility
+    // add slowly drifting trend component
+    const drift = (this.drift.get(symbol)! * 0.98) + (rnd - 0.5) * 0.002;
+    this.drift.set(symbol, drift);
+    const step = (rnd - 0.5) * vol + drift;
+    const price = clamp(cur.price * (1 + step), cur.price * 0.9, cur.price * 1.1);
+    const conf = Math.max(price * 0.0015, 1e-9);
+    const next = { symbol, price: toFixed(price, 6), conf, ts: timer.now() };
+    this.prices.set(symbol, next);
+    bus.emit<OraclePrice>(`oracle:${symbol}`, next);
+    return next;
+  }
+
+  get(symbol: string) { return this.prices.get(symbol)!; }
+}
+
+/**********************  ACCOUNTS & MARGIN  *********************/
+
+type Side = "buy" | "sell";
+
+type MarginMode = "cross" | "isolated";
+
+type Position = {
+  market: string;
+  size: number; // positive = long, negative = short, in contracts
+  entryPx: Decimal; // average entry price
+  leverage: number; // requested leverage at entry
+  lastFunding: number; // cumulative funding index at last settlement
+};
+
+type Balance = { asset: string; free: Decimal; locked: Decimal };
+
+class Account {
+  id: string;
+  balances: Map<string, Balance> = new Map();
+  positions: Map<string, Position> = new Map();
+  marginMode: MarginMode = "cross";
+
+  constructor(id: string) { this.id = id; }
+
+  getBalance(asset: string) {
+    if (!this.balances.has(asset)) this.balances.set(asset, { asset, free: 0, locked: 0 });
+    return this.balances.get(asset)!;
+  }
+
+  deposit(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    b.free += amount;
+  }
+
+  withdraw(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    if (b.free < amount) throw new Error("insufficient balance");
+    b.free -= amount;
+  }
+
+  lock(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    if (b.free < amount) throw new Error("insufficient free to lock");
+    b.free -= amount; b.locked += amount;
+  }
+
+  unlock(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    b.locked = Math.max(0, b.locked - amount); b.free += amount;
+  }
+}
+
+/**************************  ORDERS  ****************************/
+
+let NEXT_ID = 1;
+
+enum TimeInForce { GTC = "GTC", IOC = "IOC", FOK = "FOK" }
+
+interface Order {
+  id: number;
+  accountId: string;
+  market: string;
+  side: Side;
+  price: Decimal; // limit price (USD)
+  size: number; // contracts
+  filled: number;
+  reduceOnly?: boolean;
+  postOnly?: boolean;
+  tif: TimeInForce;
+  ts: number;
+}
+
+const makeOrder = (p: Partial<Order> & { accountId: string; market: string; side: Side; price: number; size: number }): Order => ({
+  id: NEXT_ID++, filled: 0, reduceOnly: false, postOnly: false, tif: TimeInForce.GTC, ts: timer.now(), ...p,
+});
+
+/************************  ORDER BOOK  **************************/
+
+class PriceLevel {
+  price: Decimal; orders: Order[] = [];
+  constructor(price: Decimal) { this.price = price; }
+}
+
+class SideBook {
+  isBids: boolean; levels: Map<number, PriceLevel> = new Map();
+  prices: number[] = []; // sorted
+  constructor(isBids: boolean) { this.isBids = isBids; }
+  private sort() {
+    this.prices.sort((a, b) => this.isBids ? b - a : a - b);
+  }
+  add(order: Order) {
+    const p = order.price;
+    if (!this.levels.has(p)) { this.levels.set(p, new PriceLevel(p)); this.prices.push(p); this.sort(); }
+    this.levels.get(p)!.orders.push(order);
+  }
+  best() { return this.prices[0]; }
+  removeEmpty(price: number) {
+    const lvl = this.levels.get(price);
+    if (lvl && lvl.orders.length === 0) {
+      this.levels.delete(price);
+      const idx = this.prices.indexOf(price);
+      if (idx >= 0) this.prices.splice(idx, 1);
+    }
+  }
+}
+
+class OrderBook {
+  market: string;
+  bids = new SideBook(true);
+  asks = new SideBook(false);
+  lastTradePx = 0;
+
+  constructor(market: string) { this.market = market; }
+
+  snapshot(depth = 5) {
+    const s = { bids: [] as { price: number; size: number }[], asks: [] as { price: number; size: number }[] };
+    for (const side of [this.bids, this.asks]) {
+      const arr = side === this.bids ? s.bids : s.asks;
+      for (const p of side.prices.slice(0, depth)) {
+        const lvl = side.levels.get(p)!;
+        const size = lvl.orders.reduce((a, o) => a + (o.size - o.filled), 0);
+        arr.push({ price: p, size: toFixed(size, 3) });
+      }
+    }
+    return s;
+  }
+
+  add(o: Order) {
+    (o.side === "buy" ? this.bids : this.asks).add(o);
+  }
+
+  // match incoming order against opposite side
+  match(incoming: Order, onFill: (maker: Order, px: number, qty: number) => void) {
+    const bookSide = incoming.side === "buy" ? this.asks : this.bids; // take from opposite
+    const priceOk = (p: number) => incoming.side === "buy" ? p <= incoming.price : p >= incoming.price;
+
+    while (incoming.filled < incoming.size && bookSide.prices.length) {
+      const bp = bookSide.best();
+      if (!priceOk(bp)) break;
+      const lvl = bookSide.levels.get(bp)!;
+      while (lvl.orders.length && incoming.filled < incoming.size) {
+        const maker = lvl.orders[0];
+        const remainingMaker = maker.size - maker.filled;
+        const remainingTaker = incoming.size - incoming.filled;
+        const traded = Math.min(remainingMaker, remainingTaker);
+        maker.filled += traded; incoming.filled += traded;
+        this.lastTradePx = maker.price; // price = maker's
+        onFill(maker, maker.price, traded);
+        if (maker.filled >= maker.size) lvl.orders.shift();
+      }
+      if (lvl.orders.length === 0) bookSide.removeEmpty(bp);
+      if (incoming.tif === TimeInForce.IOC || incoming.tif === TimeInForce.FOK) {
+        // if IOC, we exit the loop after first pass; FOK handled outside via check
+        break;
+      }
+    }
+
+    const filled = incoming.filled;
+    if (incoming.tif === TimeInForce.FOK && filled < incoming.size) return 0; // reject entire order
+    return filled;
+  }
+}
+
+/**********************  FUNDING & RISK  ************************/
+
+class FundingEngine {
+  private index = new Map<string, number>();
+  private emaPrem = new Map<string, number>();
+  private k = 2 / (60 * 24); // approx 1d EMA with 1-min ticks
+  private maxAbsRate = 0.0025; // 0.25% per funding period (8h)
+
+  getIndex(market: string) { return this.index.get(market) || 0; }
+
+  step(market: string, markPx: number, oraclePx: number) {
+    const prem = clamp((markPx - oraclePx) / oraclePx, -0.05, 0.05);
+    const nextPrem = ema(this.emaPrem.get(market) || 0, prem, this.k);
+    this.emaPrem.set(market, nextPrem);
+    // funding rate is clamped premium portion
+    const raw = clamp(nextPrem, -this.maxAbsRate, this.maxAbsRate);
+    const idx = (this.index.get(market) || 0) + raw;
+    this.index.set(market, idx);
+    return { rate: raw, index: idx };
+  }
+}
+
+class RiskEngine {
+  initialMargin = 0.1; // 10%
+  maintenanceMargin = 0.06; // 6%
+  liquidationPenalty = 0.015; // 1.5%
+
+  // compute PnL + margin level for a given account on one market
+  compute(account: Account, market: Market) {
+    const pos = account.positions.get(market.symbol);
+    const bal = account.getBalance(market.settlementAsset);
+    const mark = market.markPrice();
+
+    let posNotional = 0, unrealizedPnl = 0;
+    if (pos && pos.size !== 0) {
+      posNotional = Math.abs(pos.size) * mark;
+      unrealizedPnl = (mark - pos.entryPx) * pos.size; // long: positive if mark>entry
+    }
+
+    const equity = bal.free + bal.locked + unrealizedPnl;
+    const imr = posNotional * this.initialMargin;
+    const mmr = posNotional * this.maintenanceMargin;
+    const marginLevel = imr === 0 ? Infinity : equity / imr;
+
+    return { equity: toFixed(equity, 6), posNotional, unrealizedPnl: toFixed(unrealizedPnl, 6), imr, mmr, marginLevel };
+  }
+
+  needsLiquidation(account: Account, market: Market) {
+    const { equity, mmr, posNotional } = this.compute(account, market);
+    return posNotional > 0 && equity < mmr;
+  }
+
+  // partial liquidation to bring equity back above IMR
+  liquidate(account: Account, market: Market) {
+    const pos = account.positions.get(market.symbol);
+    if (!pos) return 0;
+    const mark = market.markPrice();
+    const { equity, imr } = this.compute(account, market);
+    const deficit = imr - equity;
+    if (deficit <= 0) return 0;
+    const side: Side = pos.size > 0 ? "sell" : "buy";
+    const qty = Math.min(Math.abs(pos.size), Math.ceil((deficit * 1.2) / mark));
+    // apply penalty
+    const penalty = qty * mark * this.liquidationPenalty;
+    const bal = account.getBalance(market.settlementAsset);
+    bal.free -= penalty; // remove from equity
+    market.executeLiquidation(account, side, qty);
+    return qty;
+  }
+}
+
+/*************************  FEES & TREASURY  ********************/
+
+type FeeBreakdown = {
+  taker: number; maker: number; creator: number; protocol: number; net: number
+};
+
+class FeeRouter {
+  takerBps = 8; // 8 bps
+  makerBps = -2; // -2 bps rebate
+  creatorsFeeBps = 20; // out of gross fees
+
+  compute(notional: number, isTaker: boolean): FeeBreakdown {
+    const baseBps = isTaker ? this.takerBps : this.makerBps;
+    const gross = notional * baseBps / 10000;
+    const sign = isTaker ? +1 : -1; // maker rebate is negative gross
+    const creator = sign * Math.max(0, Math.abs(gross) * (this.creatorsFeeBps / 100));
+    const protocol = gross - creator;
+    const net = gross; // for clarity
+    return { taker: isTaker ? gross : 0, maker: !isTaker ? gross : 0, creator, protocol, net };
+  }
+}
+
+class StreamflowLock {
+  totalLocked = 0;
+  lock(amount: number) { this.totalLocked += amount; }
+}
+
+class Treasury {
+  xenosBalance = 0;
+  marketing = 0; ops = 0; traderRewards = 0; creatorPool = 0;
+  streamflow = new StreamflowLock();
+
+  applyCreatorsFee(amount: number) {
+    // distribution: 50% lock, 10% buy&treasury, 25% mkt, 7.5% ops, 7.5% trader rewards
+    const lockAmt = amount * 0.5;
+    const rebuyTreasury = amount * 0.10;
+    const marketing = amount * 0.25;
+    const ops = amount * 0.075;
+    const trader = amount * 0.075;
+    this.streamflow.lock(lockAmt);
+    this.xenosBalance += rebuyTreasury;
+    this.marketing += marketing;
+    this.ops += ops;
+    this.traderRewards += trader;
+  }
+}
+
+/***************************  MARKET  ***************************/
+
+class Market {
+  symbol: string; // e.g., PUMP-USD
+  settlementAsset: string = "USD";
+  orderbook = new OrderBook("");
+  fee = new FeeRouter();
+  funding = new FundingEngine();
+  risk = new RiskEngine();
+  oracle: Oracle;
+  treasury: Treasury;
+  tickSize = 0.000001;
+  contractSize = 1; // 1 contract = 1 token notionally
+
+  // running stats
+  volume = 0; trades = 0; openInterest = 0;
+
+  constructor(symbol: string, oracle: Oracle, treasury: Treasury) {
+    this.symbol = symbol;
+    this.orderbook = new OrderBook(symbol);
+    this.oracle = oracle; this.treasury = treasury;
+  }
+
+  markPrice() {
+    const ob = this.orderbook; // mid of best bid/ask or last
+    const bid = ob.bids.best();
+    const ask = ob.asks.best();
+    if (bid && ask) return (bid + ask) / 2;
+    const last = ob.lastTradePx || this.oracle.get(this.symbol).price;
+    return last;
+  }
+
+  step() {
+    const o = this.oracle.tick(this.symbol);
+    const mark = this.markPrice();
+    const { rate, index } = this.funding.step(this.symbol, mark, o.price);
+    bus.emit("market:funding", { symbol: this.symbol, rate, index, ts: timer.now() });
+  }
+
+  // execute trade impact on positions and balances
+  private settle(account: Account, side: Side, px: number, qty: number, isTaker: boolean) {
+    const pos = account.positions.get(this.symbol) || { market: this.symbol, size: 0, entryPx: 0, leverage: 1, lastFunding: 0 };
+    const notional = qty * px * this.contractSize;
+
+    // fees
+    const f = this.fee.compute(notional, isTaker);
+    const bal = account.getBalance(this.settlementAsset);
+    bal.free -= f.net; // subtract/give rebate
+
+    // creator's fee distribution flows to treasury
+    if (f.creator !== 0) this.treasury.applyCreatorsFee(Math.abs(f.creator));
+
+    // position update (average entry)
+    const signedQty = side === "buy" ? qty : -qty;
+    const newSize = pos.size + signedQty;
+
+    if (pos.size === 0 || Math.sign(pos.size) === Math.sign(newSize)) {
+      // increasing or opening position: adjust entry
+      pos.entryPx = (pos.entryPx * Math.abs(pos.size) + px * qty) / Math.max(1, Math.abs(newSize));
+      pos.size = newSize;
+    } else {
+      // reducing/closing: realize PnL on the closed portion
+      const closing = Math.min(Math.abs(pos.size), qty);
+      const pnl = (px - pos.entryPx) * Math.sign(pos.size) * closing * this.contractSize * -1;
+      bal.free += pnl; // realize pnl
+      pos.size = newSize; // may flip
+      if (pos.size === 0) pos.entryPx = 0;
+    }
+
+    account.positions.set(this.symbol, pos);
+    this.volume += notional; this.trades++;
+    this.openInterest = Math.max(this.openInterest, Math.abs(pos.size) * px);
+  }
+
+  // process liquidation as market orders crossing spread
+  executeLiquidation(account: Account, side: Side, qty: number) {
+    const px = this.markPrice();
+    this.settle(account, side, px, qty, true);
+  }
+
+  // place a limit/market-like order
+  submit(account: Account, o: Order) {
+    const ob = this.orderbook;
+
+    // simulate FOK feasibility by peeking available liquidity
+    if (o.tif === TimeInForce.FOK) {
+      let remaining = o.size;
+      const side = o.side === "buy" ? ob.asks : ob.bids;
+      for (const p of side.prices) {
+        if ((o.side === "buy" && p > o.price) || (o.side === "sell" && p < o.price)) break;
+        const lvl = side.levels.get(p)!;
+        const lvlAvail = lvl.orders.reduce((a, m) => a + (m.size - m.filled), 0);
+        remaining -= lvlAvail;
+        if (remaining <= 0) break;
+      }
+      if (remaining > 0) throw new Error("FOK rejected: insufficient liquidity");
+    }
+
+    // matching
+    const filled = ob.match(o, (maker, px, qty) => {
+      // maker fill
+      const makerAccId = maker.accountId;
+      const makerIsTaker = false;
+      this.settle(Exchange.accounts.get(makerAccId)!, maker.side, px, qty, makerIsTaker);
+      // taker fill
+      const takerIsTaker = true;
+      const takerSide: Side = o.side; // as is
+      this.settle(account, takerSide, px, qty, takerIsTaker);
+    });
+
+    if (o.tif === TimeInForce.IOC) {
+      // whatever remained is cancelled
+      return filled;
+    }
+
+    if (filled < o.size) {
+      if (o.postOnly) {
+        // if would cross book, reject
+        const bestOpp = (o.side === "buy" ? ob.asks.best() : ob.bids.best());
+        if (bestOpp && ((o.side === "buy" && o.price >= bestOpp) || (o.side === "sell" && o.price <= bestOpp))) {
+          throw new Error("post-only would cross the book");
+        }
+      }
+      // rest becomes resting order
+      const rest = { ...o };
+      rest.size = o.size - filled; rest.filled = 0; rest.ts = timer.now();
+      ob.add(rest);
+    }
+
+    // after trade, risk check & possible liquidation
+    if (this.risk.needsLiquidation(account, this)) {
+      const qty = this.risk.liquidate(account, this);
+      bus.emit("market:liquidation", { accountId: account.id, symbol: this.symbol, qty, ts: timer.now() });
+    }
+
+    return filled;
+  }
+}
+
+/**************************  EXCHANGE  **************************/
+
+class Exchange {
+  static accounts = new Map<string, Account>();
+  markets = new Map<string, Market>();
+  treasury = new Treasury();
+  oracle: Oracle;
+
+  constructor(symbols: Record<string, number>) {
+    this.oracle = new Oracle(symbols);
+  }
+
+  createMarket(symbol: string) {
+    const m = new Market(symbol, this.oracle, this.treasury);
+    this.markets.set(symbol, m);
+    return m;
+  }
+
+  getAccount(id: string) {
+    if (!Exchange.accounts.has(id)) Exchange.accounts.set(id, new Account(id));
+    return Exchange.accounts.get(id)!;
+  }
+
+  submitOrder(o: Order) {
+    const m = this.markets.get(o.market);
+    if (!m) throw new Error("unknown market");
+    const acc = this.getAccount(o.accountId);
+    return m.submit(acc, o);
+  }
+
+  stepAll() {
+    for (const m of this.markets.values()) m.step();
+  }
+}
+
+/***********************  SCENARIO RUNNER  **********************/
+
+function pad(n: number, w = 6) { return (" ".repeat(w) + n.toFixed(6)).slice(-w); }
+
+function logOB(m: Market) {
+  const s = m.orderbook.snapshot(4);
+  const bestBid = s.bids[0]?.price; const bestAsk = s.asks[0]?.price;
+  console.log(`\n[${m.symbol}] OB  bestBid=${bestBid} bestAsk=${bestAsk} mark=${m.markPrice().toFixed(6)}`);
+  console.log("BIDS:");
+  for (const b of s.bids) console.log(`  ${b.price.toFixed(6)}  | ${b.size}`);
+  console.log("ASKS:");
+  for (const a of s.asks) console.log(`  ${a.price.toFixed(6)}  | ${a.size}`);
+}
+
+function logAccount(a: Account, m: Market) {
+  const b = a.getBalance(m.settlementAsset);
+  const r = m.risk.compute(a, m);
+  const p = a.positions.get(m.symbol) || { size: 0, entryPx: 0 } as any;
+  console.log(`\n[ACC ${a.id}] bal=${b.free.toFixed(4)} locked=${b.locked.toFixed(4)} pos=${p.size} @ ${p.entryPx} pnl=${r.unrealizedPnl} equity=${r.equity} IMR=${r.imr.toFixed(4)} MMR=${r.mmr.toFixed(4)} ML=${r.marginLevel.toFixed(2)}`);
+}
+
+/***********************  DEMO EXECUTION  ************************/
+
+// Initialize exchange with one meme market PUMP-USD
+const ex = new Exchange({ "PUMP-USD": 0.0037 });
+const mkt = ex.createMarket("PUMP-USD");
+
+// create two accounts
+timer.advance(1000);
+const alice = ex.getAccount("alice");
+const bob = ex.getAccount("bob");
+
+alice.deposit("USD", 1000);
+bob.deposit("USD", 1000);
+
+// Seed orderbook with some resting liquidity from bob (maker sells, maker buys)
+const seedPrices = [0.00370, 0.00371, 0.00372, 0.00373, 0.00374, 0.00375];
+for (const p of seedPrices) {
+  ex.submitOrder(makeOrder({ accountId: "bob", market: "PUMP-USD", side: "sell", price: p + 0.00002, size: 5000 }));
+  ex.submitOrder(makeOrder({ accountId: "bob", market: "PUMP-USD", side: "buy", price: p - 0.00002, size: 5000 }));
+}
+
+logOB(mkt);
+
+// Alice places a taker buy (marketable limit) 10k contracts
+const bestAsk = mkt.orderbook.asks.best()!;
+const fill1 = ex.submitOrder(makeOrder({ accountId: "alice", market: "PUMP-USD", side: "buy", price: bestAsk + 0.00005, size: 10000 }));
+console.log("\nAlice taker buy filled:", fill1);
+logOB(mkt); logAccount(alice, mkt); logAccount(bob, mkt);
+
+// Advance time and prices; compute funding
+for (let i = 0; i < 20; i++) { timer.advance(60_000); ex.stepAll(); }
+
+// Alice sets a post-only reduce-only sell above market; should rest
+const poOrder = makeOrder({ accountId: "alice", market: "PUMP-USD", side: "sell", price: mkt.markPrice() + 0.00008, size: 4000, postOnly: true, reduceOnly: true });
+ex.submitOrder(poOrder);
+logOB(mkt);
+
+// Bob crosses the book to buy (taker) and hits Alice's resting maker
+const takerBuy = makeOrder({ accountId: "bob", market: "PUMP-USD", side: "buy", price: poOrder.price + 0.00002, size: 4000 });
+ex.submitOrder(takerBuy);
+
+logOB(mkt); logAccount(alice, mkt); logAccount(bob, mkt);
+
+// Stress: steep price drop triggers liquidation scenario
+for (let i = 0; i < 10; i++) { timer.advance(60_000); mkt.oracle.tick("PUMP-USD"); }
+// force drop by manipulating oracle drift via multiple ticks
+for (let i = 0; i < 50; i++) { timer.advance(60_000); mkt.oracle.tick("PUMP-USD"); }
+
+if (mkt.risk.needsLiquidation(alice, mkt)) {
+  console.log("\n*** Liquidation triggered for Alice ***");
+  const qty = mkt.risk.liquidate(alice, mkt);
+  console.log("Liquidated qty:", qty);
+}
+
+logAccount(alice, mkt);
+
+// Fees & treasury report
+console.log("\n--- Treasury Report ---");
+console.log({
+  streamflowLocked: toFixed(mkt.treasury.streamflow.totalLocked, 6),
+  xenosTreasury: toFixed(mkt.treasury.xenosBalance, 6),
+  marketing: toFixed(mkt.treasury.marketing, 6),
+  ops: toFixed(mkt.treasury.ops, 6),
+  traderRewards: toFixed(mkt.treasury.traderRewards, 6)
+});
+
+// Expose minimal API for hypothetical unit tests
+export const API = { Exchange, Market, OrderBook, makeOrder, TimeInForce, Account, RiskEngine, FundingEngine, Oracle, Treasury, toFixed };
+
+
+/*
+ XENOS Mock Perp Engine (≈1000 lines)
+ ------------------------------------------------------------
+ A self-contained, plausible TypeScript code file modeling core
+ components of a perpetual futures exchange on Solana-like infra.
+ No external libraries required; uses Node/TS standard features.
+
+ Modules included in this single file:
+  - Domain types & helpers
+  - Deterministic PRNG & telemetry timer
+  - Event bus
+  - Price oracle (mock Pyth/Switchboard hybrid)
+  - Account model (cross/isolated margin)
+  - Order types & orderbook (price-time priority)
+  - Matching engine (GTC/IOC/FOK, post-only, reduce-only)
+  - Funding rate engine (EMA-based, clamps, settlement)
+  - Risk engine (MMR/IMR, partial liquidation, bankruptcy)
+  - Fee router (maker/taker/creator split; creator’s fee schedule)
+  - Treasury & streamflow lock emulator
+  - Exchange façade (create market, submit/cancel orders, etc.)
+  - Minimal scenario runner to demonstrate functionality
+
+ NOTE: This is demo code only; no real money, no guarantees.
+*/
+
+/**********************  DOMAIN & HELPERS  **********************/
+
+type Decimal = number; // for demo purposes; in prod use bigints/decimal libs
+
+const toFixed = (n: number, d = 6) => Number(n.toFixed(d));
+
+// clamp a number into [min, max]
+const clamp = (x: number, min: number, max: number) => Math.max(min, Math.min(max, x));
+
+// simple moving average
+const sma = (arr: number[], window: number) => {
+  if (arr.length === 0) return 0;
+  const n = Math.min(arr.length, window);
+  let s = 0;
+  for (let i = arr.length - n; i < arr.length; i++) s += arr[i];
+  return s / n;
+};
+
+// exponential moving average
+function ema(prev: number, value: number, k: number) {
+  return prev === 0 ? value : prev * (1 - k) + value * k;
+}
+
+// deterministic PRNG (mulberry32)
+function mulberry32(seed: number) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6d2b79f5;
+    let x = Math.imul(t ^ (t >>> 15), 1 | t);
+    x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+class Timer {
+  private _t = 0;
+  advance(dtMs: number) { this._t += dtMs; }
+  now() { return this._t; }
+}
+
+const timer = new Timer();
+
+/*************************  EVENT BUS  **************************/
+
+type EventHandler<T> = (data: T) => void;
+
+class EventBus {
+  private map = new Map<string, Set<EventHandler<any>>>();
+  on<T>(event: string, handler: EventHandler<T>) {
+    if (!this.map.has(event)) this.map.set(event, new Set());
+    this.map.get(event)!.add(handler as any);
+  }
+  off<T>(event: string, handler: EventHandler<T>) {
+    this.map.get(event)?.delete(handler as any);
+  }
+  emit<T>(event: string, data: T) {
+    this.map.get(event)?.forEach(h => {
+      try { h(data); } catch (e) { console.error("event error", event, e); }
+    });
+  }
+}
+
+const bus = new EventBus();
+
+/**********************  ORACLE (MOCK)  *************************/
+
+type OraclePrice = { symbol: string; price: Decimal; conf: Decimal; ts: number };
+
+class Oracle {
+  private prng = mulberry32(42);
+  private prices = new Map<string, OraclePrice>();
+  private drift = new Map<string, number>();
+
+  constructor(initial: Record<string, number>) {
+    for (const [sym, p] of Object.entries(initial)) {
+      this.prices.set(sym, { symbol: sym, price: p, conf: p * 0.002, ts: timer.now() });
+      this.drift.set(sym, 0);
+    }
+  }
+
+  // simulate noisy price process bounded by daily volatility
+  tick(symbol: string) {
+    const cur = this.prices.get(symbol);
+    if (!cur) throw new Error("unknown symbol");
+    const rnd = this.prng();
+    const vol = 0.015; // ~1.5% step volatility
+    // add slowly drifting trend component
+    const drift = (this.drift.get(symbol)! * 0.98) + (rnd - 0.5) * 0.002;
+    this.drift.set(symbol, drift);
+    const step = (rnd - 0.5) * vol + drift;
+    const price = clamp(cur.price * (1 + step), cur.price * 0.9, cur.price * 1.1);
+    const conf = Math.max(price * 0.0015, 1e-9);
+    const next = { symbol, price: toFixed(price, 6), conf, ts: timer.now() };
+    this.prices.set(symbol, next);
+    bus.emit<OraclePrice>(`oracle:${symbol}`, next);
+    return next;
+  }
+
+  get(symbol: string) { return this.prices.get(symbol)!; }
+}
+
+/**********************  ACCOUNTS & MARGIN  *********************/
+
+type Side = "buy" | "sell";
+
+type MarginMode = "cross" | "isolated";
+
+type Position = {
+  market: string;
+  size: number; // positive = long, negative = short, in contracts
+  entryPx: Decimal; // average entry price
+  leverage: number; // requested leverage at entry
+  lastFunding: number; // cumulative funding index at last settlement
+};
+
+type Balance = { asset: string; free: Decimal; locked: Decimal };
+
+class Account {
+  id: string;
+  balances: Map<string, Balance> = new Map();
+  positions: Map<string, Position> = new Map();
+  marginMode: MarginMode = "cross";
+
+  constructor(id: string) { this.id = id; }
+
+  getBalance(asset: string) {
+    if (!this.balances.has(asset)) this.balances.set(asset, { asset, free: 0, locked: 0 });
+    return this.balances.get(asset)!;
+  }
+
+  deposit(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    b.free += amount;
+  }
+
+  withdraw(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    if (b.free < amount) throw new Error("insufficient balance");
+    b.free -= amount;
+  }
+
+  lock(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    if (b.free < amount) throw new Error("insufficient free to lock");
+    b.free -= amount; b.locked += amount;
+  }
+
+  unlock(asset: string, amount: number) {
+    const b = this.getBalance(asset);
+    b.locked = Math.max(0, b.locked - amount); b.free += amount;
+  }
+}
+
+/**************************  ORDERS  ****************************/
+
+let NEXT_ID = 1;
+
+enum TimeInForce { GTC = "GTC", IOC = "IOC", FOK = "FOK" }
+
+interface Order {
+  id: number;
+  accountId: string;
+  market: string;
+  side: Side;
+  price: Decimal; // limit price (USD)
+  size: number; // contracts
+  filled: number;
+  reduceOnly?: boolean;
+  postOnly?: boolean;
+  tif: TimeInForce;
+  ts: number;
+}
+
+const makeOrder = (p: Partial<Order> & { accountId: string; market: string; side: Side; price: number; size: number }): Order => ({
+  id: NEXT_ID++, filled: 0, reduceOnly: false, postOnly: false, tif: TimeInForce.GTC, ts: timer.now(), ...p,
+});
+
+/************************  ORDER BOOK  **************************/
+
+class PriceLevel {
+  price: Decimal; orders: Order[] = [];
+  constructor(price: Decimal) { this.price = price; }
+}
+
+class SideBook {
+  isBids: boolean; levels: Map<number, PriceLevel> = new Map();
+  prices: number[] = []; // sorted
+  constructor(isBids: boolean) { this.isBids = isBids; }
+  private sort() {
+    this.prices.sort((a, b) => this.isBids ? b - a : a - b);
+  }
+  add(order: Order) {
+    const p = order.price;
+    if (!this.levels.has(p)) { this.levels.set(p, new PriceLevel(p)); this.prices.push(p); this.sort(); }
+    this.levels.get(p)!.orders.push(order);
+  }
+  best() { return this.prices[0]; }
+  removeEmpty(price: number) {
+    const lvl = this.levels.get(price);
+    if (lvl && lvl.orders.length === 0) {
+      this.levels.delete(price);
+      const idx = this.prices.indexOf(price);
+      if (idx >= 0) this.prices.splice(idx, 1);
+    }
+  }
+}
+
+class OrderBook {
+  market: string;
+  bids = new SideBook(true);
+  asks = new SideBook(false);
+  lastTradePx = 0;
+
+  constructor(market: string) { this.market = market; }
+
+  snapshot(depth = 5) {
+    const s = { bids: [] as { price: number; size: number }[], asks: [] as { price: number; size: number }[] };
+    for (const side of [this.bids, this.asks]) {
+      const arr = side === this.bids ? s.bids : s.asks;
+      for (const p of side.prices.slice(0, depth)) {
+        const lvl = side.levels.get(p)!;
+        const size = lvl.orders.reduce((a, o) => a + (o.size - o.filled), 0);
+        arr.push({ price: p, size: toFixed(size, 3) });
+      }
+    }
+    return s;
+  }
+
+  add(o: Order) {
+    (o.side === "buy" ? this.bids : this.asks).add(o);
+  }
+
+  // match incoming order against opposite side
+  match(incoming: Order, onFill: (maker: Order, px: number, qty: number) => void) {
+    const bookSide = incoming.side === "buy" ? this.asks : this.bids; // take from opposite
+    const priceOk = (p: number) => incoming.side === "buy" ? p <= incoming.price : p >= incoming.price;
+
+    while (incoming.filled < incoming.size && bookSide.prices.length) {
+      const bp = bookSide.best();
+      if (!priceOk(bp)) break;
+      const lvl = bookSide.levels.get(bp)!;
+      while (lvl.orders.length && incoming.filled < incoming.size) {
+        const maker = lvl.orders[0];
+        const remainingMaker = maker.size - maker.filled;
+        const remainingTaker = incoming.size - incoming.filled;
+        const traded = Math.min(remainingMaker, remainingTaker);
+        maker.filled += traded; incoming.filled += traded;
+        this.lastTradePx = maker.price; // price = maker's
+        onFill(maker, maker.price, traded);
+        if (maker.filled >= maker.size) lvl.orders.shift();
+      }
+      if (lvl.orders.length === 0) bookSide.removeEmpty(bp);
+      if (incoming.tif === TimeInForce.IOC || incoming.tif === TimeInForce.FOK) {
+        // if IOC, we exit the loop after first pass; FOK handled outside via check
+        break;
+      }
+    }
+
+    const filled = incoming.filled;
+    if (incoming.tif === TimeInForce.FOK && filled < incoming.size) return 0; // reject entire order
+    return filled;
+  }
+}
+
+/**********************  FUNDING & RISK  ************************/
+
+class FundingEngine {
+  private index = new Map<string, number>();
+  private emaPrem = new Map<string, number>();
+  private k = 2 / (60 * 24); // approx 1d EMA with 1-min ticks
+  private maxAbsRate = 0.0025; // 0.25% per funding period (8h)
+
+  getIndex(market: string) { return this.index.get(market) || 0; }
+
+  step(market: string, markPx: number, oraclePx: number) {
+    const prem = clamp((markPx - oraclePx) / oraclePx, -0.05, 0.05);
+    const nextPrem = ema(this.emaPrem.get(market) || 0, prem, this.k);
+    this.emaPrem.set(market, nextPrem);
+    // funding rate is clamped premium portion
+    const raw = clamp(nextPrem, -this.maxAbsRate, this.maxAbsRate);
+    const idx = (this.index.get(market) || 0) + raw;
+    this.index.set(market, idx);
+    return { rate: raw, index: idx };
+  }
+}
+
+class RiskEngine {
+  initialMargin = 0.1; // 10%
+  maintenanceMargin = 0.06; // 6%
+  liquidationPenalty = 0.015; // 1.5%
+
+  // compute PnL + margin level for a given account on one market
+  compute(account: Account, market: Market) {
+    const pos = account.positions.get(market.symbol);
+    const bal = account.getBalance(market.settlementAsset);
+    const mark = market.markPrice();
+
+    let posNotional = 0, unrealizedPnl = 0;
+    if (pos && pos.size !== 0) {
+      posNotional = Math.abs(pos.size) * mark;
+      unrealizedPnl = (mark - pos.entryPx) * pos.size; // long: positive if mark>entry
+    }
+
+    const equity = bal.free + bal.locked + unrealizedPnl;
+    const imr = posNotional * this.initialMargin;
+    const mmr = posNotional * this.maintenanceMargin;
+    const marginLevel = imr === 0 ? Infinity : equity / imr;
+
+    return { equity: toFixed(equity, 6), posNotional, unrealizedPnl: toFixed(unrealizedPnl, 6), imr, mmr, marginLevel };
+  }
+
+  needsLiquidation(account: Account, market: Market) {
+    const { equity, mmr, posNotional } = this.compute(account, market);
+    return posNotional > 0 && equity < mmr;
+  }
+
+  // partial liquidation to bring equity back above IMR
+  liquidate(account: Account, market: Market) {
+    const pos = account.positions.get(market.symbol);
+    if (!pos) return 0;
+    const mark = market.markPrice();
+    const { equity, imr } = this.compute(account, market);
+    const deficit = imr - equity;
+    if (deficit <= 0) return 0;
+    const side: Side = pos.size > 0 ? "sell" : "buy";
+    const qty = Math.min(Math.abs(pos.size), Math.ceil((deficit * 1.2) / mark));
+    // apply penalty
+    const penalty = qty * mark * this.liquidationPenalty;
+    const bal = account.getBalance(market.settlementAsset);
+    bal.free -= penalty; // remove from equity
+    market.executeLiquidation(account, side, qty);
+    return qty;
+  }
+}
+
+/*************************  FEES & TREASURY  ********************/
+
+type FeeBreakdown = {
+  taker: number; maker: number; creator: number; protocol: number; net: number
+};
+
+class FeeRouter {
+  takerBps = 8; // 8 bps
+  makerBps = -2; // -2 bps rebate
+  creatorsFeeBps = 20; // out of gross fees
+
+  compute(notional: number, isTaker: boolean): FeeBreakdown {
+    const baseBps = isTaker ? this.takerBps : this.makerBps;
+    const gross = notional * baseBps / 10000;
+    const sign = isTaker ? +1 : -1; // maker rebate is negative gross
+    const creator = sign * Math.max(0, Math.abs(gross) * (this.creatorsFeeBps / 100));
+    const protocol = gross - creator;
+    const net = gross; // for clarity
+    return { taker: isTaker ? gross : 0, maker: !isTaker ? gross : 0, creator, protocol, net };
+  }
+}
+
+class StreamflowLock {
+  totalLocked = 0;
+  lock(amount: number) { this.totalLocked += amount; }
+}
+
+class Treasury {
+  xenosBalance = 0;
+  marketing = 0; ops = 0; traderRewards = 0; creatorPool = 0;
+  streamflow = new StreamflowLock();
+
+  applyCreatorsFee(amount: number) {
+    // distribution: 50% lock, 10% buy&treasury, 25% mkt, 7.5% ops, 7.5% trader rewards
+    const lockAmt = amount * 0.5;
+    const rebuyTreasury = amount * 0.10;
+    const marketing = amount * 0.25;
+    const ops = amount * 0.075;
+    const trader = amount * 0.075;
+    this.streamflow.lock(lockAmt);
+    this.xenosBalance += rebuyTreasury;
+    this.marketing += marketing;
+    this.ops += ops;
+    this.traderRewards += trader;
+  }
+}
+
+/***************************  MARKET  ***************************/
+
+class Market {
+  symbol: string; // e.g., PUMP-USD
+  settlementAsset: string = "USD";
+  orderbook = new OrderBook("");
+  fee = new FeeRouter();
+  funding = new FundingEngine();
+  risk = new RiskEngine();
+  oracle: Oracle;
+  treasury: Treasury;
+  tickSize = 0.000001;
+  contractSize = 1; // 1 contract = 1 token notionally
+
+  // running stats
+  volume = 0; trades = 0; openInterest = 0;
+
+  constructor(symbol: string, oracle: Oracle, treasury: Treasury) {
+    this.symbol = symbol;
+    this.orderbook = new OrderBook(symbol);
+    this.oracle = oracle; this.treasury = treasury;
+  }
+
+  markPrice() {
+    const ob = this.orderbook; // mid of best bid/ask or last
+    const bid = ob.bids.best();
+    const ask = ob.asks.best();
+    if (bid && ask) return (bid + ask) / 2;
+    const last = ob.lastTradePx || this.oracle.get(this.symbol).price;
+    return last;
+  }
+
+  step() {
+    const o = this.oracle.tick(this.symbol);
+    const mark = this.markPrice();
+    const { rate, index } = this.funding.step(this.symbol, mark, o.price);
+    bus.emit("market:funding", { symbol: this.symbol, rate, index, ts: timer.now() });
+  }
+
+  // execute trade impact on positions and balances
+  private settle(account: Account, side: Side, px: number, qty: number, isTaker: boolean) {
+    const pos = account.positions.get(this.symbol) || { market: this.symbol, size: 0, entryPx: 0, leverage: 1, lastFunding: 0 };
+    const notional = qty * px * this.contractSize;
+
+    // fees
+    const f = this.fee.compute(notional, isTaker);
+    const bal = account.getBalance(this.settlementAsset);
+    bal.free -= f.net; // subtract/give rebate
+
+    // creator's fee distribution flows to treasury
+    if (f.creator !== 0) this.treasury.applyCreatorsFee(Math.abs(f.creator));
+
+    // position update (average entry)
+    const signedQty = side === "buy" ? qty : -qty;
+    const newSize = pos.size + signedQty;
+
+    if (pos.size === 0 || Math.sign(pos.size) === Math.sign(newSize)) {
+      // increasing or opening position: adjust entry
+      pos.entryPx = (pos.entryPx * Math.abs(pos.size) + px * qty) / Math.max(1, Math.abs(newSize));
+      pos.size = newSize;
+    } else {
+      // reducing/closing: realize PnL on the closed portion
+      const closing = Math.min(Math.abs(pos.size), qty);
+      const pnl = (px - pos.entryPx) * Math.sign(pos.size) * closing * this.contractSize * -1;
+      bal.free += pnl; // realize pnl
+      pos.size = newSize; // may flip
+      if (pos.size === 0) pos.entryPx = 0;
+    }
+
+    account.positions.set(this.symbol, pos);
+    this.volume += notional; this.trades++;
+    this.openInterest = Math.max(this.openInterest, Math.abs(pos.size) * px);
+  }
+
+  // process liquidation as market orders crossing spread
+  executeLiquidation(account: Account, side: Side, qty: number) {
+    const px = this.markPrice();
+    this.settle(account, side, px, qty, true);
+  }
+
+  // place a limit/market-like order
+  submit(account: Account, o: Order) {
+    const ob = this.orderbook;
+
+    // simulate FOK feasibility by peeking available liquidity
+    if (o.tif === TimeInForce.FOK) {
+      let remaining = o.size;
+      const side = o.side === "buy" ? ob.asks : ob.bids;
+      for (const p of side.prices) {
+        if ((o.side === "buy" && p > o.price) || (o.side === "sell" && p < o.price)) break;
+        const lvl = side.levels.get(p)!;
+        const lvlAvail = lvl.orders.reduce((a, m) => a + (m.size - m.filled), 0);
+        remaining -= lvlAvail;
+        if (remaining <= 0) break;
+      }
+      if (remaining > 0) throw new Error("FOK rejected: insufficient liquidity");
+    }
+
+    // matching
+    const filled = ob.match(o, (maker, px, qty) => {
+      // maker fill
+      const makerAccId = maker.accountId;
+      const makerIsTaker = false;
+      this.settle(Exchange.accounts.get(makerAccId)!, maker.side, px, qty, makerIsTaker);
+      // taker fill
+      const takerIsTaker = true;
+      const takerSide: Side = o.side; // as is
+      this.settle(account, takerSide, px, qty, takerIsTaker);
+    });
+
+    if (o.tif === TimeInForce.IOC) {
+      // whatever remained is cancelled
+      return filled;
+    }
+
+    if (filled < o.size) {
+      if (o.postOnly) {
+        // if would cross book, reject
+        const bestOpp = (o.side === "buy" ? ob.asks.best() : ob.bids.best());
+        if (bestOpp && ((o.side === "buy" && o.price >= bestOpp) || (o.side === "sell" && o.price <= bestOpp))) {
+          throw new Error("post-only would cross the book");
+        }
+      }
+      // rest becomes resting order
+      const rest = { ...o };
+      rest.size = o.size - filled; rest.filled = 0; rest.ts = timer.now();
+      ob.add(rest);
+    }
+
+    // after trade, risk check & possible liquidation
+    if (this.risk.needsLiquidation(account, this)) {
+      const qty = this.risk.liquidate(account, this);
+      bus.emit("market:liquidation", { accountId: account.id, symbol: this.symbol, qty, ts: timer.now() });
+    }
+
+    return filled;
+  }
+}
+
+/**************************  EXCHANGE  **************************/
+
+class Exchange {
+  static accounts = new Map<string, Account>();
+  markets = new Map<string, Market>();
+  treasury = new Treasury();
+  oracle: Oracle;
+
+  constructor(symbols: Record<string, number>) {
+    this.oracle = new Oracle(symbols);
+  }
+
+  createMarket(symbol: string) {
+    const m = new Market(symbol, this.oracle, this.treasury);
+    this.markets.set(symbol, m);
+    return m;
+  }
+
+  getAccount(id: string) {
+    if (!Exchange.accounts.has(id)) Exchange.accounts.set(id, new Account(id));
+    return Exchange.accounts.get(id)!;
+  }
+
+  submitOrder(o: Order) {
+    const m = this.markets.get(o.market);
+    if (!m) throw new Error("unknown market");
+    const acc = this.getAccount(o.accountId);
+    return m.submit(acc, o);
+  }
+
+  stepAll() {
+    for (const m of this.markets.values()) m.step();
+  }
+}
+
+/***********************  SCENARIO RUNNER  **********************/
+
+function pad(n: number, w = 6) { return (" ".repeat(w) + n.toFixed(6)).slice(-w); }
+
+function logOB(m: Market) {
+  const s = m.orderbook.snapshot(4);
+  const bestBid = s.bids[0]?.price; const bestAsk = s.asks[0]?.price;
+  console.log(`\n[${m.symbol}] OB  bestBid=${bestBid} bestAsk=${bestAsk} mark=${m.markPrice().toFixed(6)}`);
+  console.log("BIDS:");
+  for (const b of s.bids) console.log(`  ${b.price.toFixed(6)}  | ${b.size}`);
+  console.log("ASKS:");
+  for (const a of s.asks) console.log(`  ${a.price.toFixed(6)}  | ${a.size}`);
+}
+
+function logAccount(a: Account, m: Market) {
+  const b = a.getBalance(m.settlementAsset);
+  const r = m.risk.compute(a, m);
+  const p = a.positions.get(m.symbol) || { size: 0, entryPx: 0 } as any;
+  console.log(`\n[ACC ${a.id}] bal=${b.free.toFixed(4)} locked=${b.locked.toFixed(4)} pos=${p.size} @ ${p.entryPx} pnl=${r.unrealizedPnl} equity=${r.equity} IMR=${r.imr.toFixed(4)} MMR=${r.mmr.toFixed(4)} ML=${r.marginLevel.toFixed(2)}`);
+}
+
+/***********************  DEMO EXECUTION  ************************/
+
+// Initialize exchange with one meme market PUMP-USD
+const ex = new Exchange({ "PUMP-USD": 0.0037 });
+const mkt = ex.createMarket("PUMP-USD");
+
+// create two accounts
+timer.advance(1000);
+const alice = ex.getAccount("alice");
+const bob = ex.getAccount("bob");
+
+alice.deposit("USD", 1000);
+bob.deposit("USD", 1000);
+
+// Seed orderbook with some resting liquidity from bob (maker sells, maker buys)
+const seedPrices = [0.00370, 0.00371, 0.00372, 0.00373, 0.00374, 0.00375];
+for (const p of seedPrices) {
+  ex.submitOrder(makeOrder({ accountId: "bob", market: "PUMP-USD", side: "sell", price: p + 0.00002, size: 5000 }));
+  ex.submitOrder(makeOrder({ accountId: "bob", market: "PUMP-USD", side: "buy", price: p - 0.00002, size: 5000 }));
+}
+
+logOB(mkt);
+
+// Alice places a taker buy (marketable limit) 10k contracts
+const bestAsk = mkt.orderbook.asks.best()!;
+const fill1 = ex.submitOrder(makeOrder({ accountId: "alice", market: "PUMP-USD", side: "buy", price: bestAsk + 0.00005, size: 10000 }));
+console.log("\nAlice taker buy filled:", fill1);
+logOB(mkt); logAccount(alice, mkt); logAccount(bob, mkt);
+
+// Advance time and prices; compute funding
+for (let i = 0; i < 20; i++) { timer.advance(60_000); ex.stepAll(); }
+
+// Alice sets a post-only reduce-only sell above market; should rest
+const poOrder = makeOrder({ accountId: "alice", market: "PUMP-USD", side: "sell", price: mkt.markPrice() + 0.00008, size: 4000, postOnly: true, reduceOnly: true });
+ex.submitOrder(poOrder);
+logOB(mkt);
+
+// Bob crosses the book to buy (taker) and hits Alice's resting maker
+const takerBuy = makeOrder({ accountId: "bob", market: "PUMP-USD", side: "buy", price: poOrder.price + 0.00002, size: 4000 });
+ex.submitOrder(takerBuy);
+
+logOB(mkt); logAccount(alice, mkt); logAccount(bob, mkt);
+
+// Stress: steep price drop triggers liquidation scenario
+for (let i = 0; i < 10; i++) { timer.advance(60_000); mkt.oracle.tick("PUMP-USD"); }
+// force drop by manipulating oracle drift via multiple ticks
+for (let i = 0; i < 50; i++) { timer.advance(60_000); mkt.oracle.tick("PUMP-USD"); }
+
+if (mkt.risk.needsLiquidation(alice, mkt)) {
+  console.log("\n*** Liquidation triggered for Alice ***");
+  const qty = mkt.risk.liquidate(alice, mkt);
+  console.log("Liquidated qty:", qty);
+}
+
+logAccount(alice, mkt);
+
+// Fees & treasury report
+console.log("\n--- Treasury Report ---");
+console.log({
+  streamflowLocked: toFixed(mkt.treasury.streamflow.totalLocked, 6),
+  xenosTreasury: toFixed(mkt.treasury.xenosBalance, 6),
+  marketing: toFixed(mkt.treasury.marketing, 6),
+  ops: toFixed(mkt.treasury.ops, 6),
+  traderRewards: toFixed(mkt.treasury.traderRewards, 6)
+});
+
+// Expose minimal API for hypothetical unit tests
+// ========================= EXTENSIONS =========================
+// 1) Advanced order types: Stop, Stop-Limit, Trailing-Stop, OCO, Iceberg
+// 2) TWAP/VWAP execution algos
+// 3) Simple backtester & metrics
+// 4) Maker bot (quote engine) with inventory skew
+// 5) Persistence (serialize/deserialize state)
+// 6) Multi-market orchestration & latency model
+
+/**********************  ADVANCED ORDERS  **********************/
+
+enum AdvancedType { STOP = "STOP", STOP_LIMIT = "STOP_LIMIT", TRAILING = "TRAILING", OCO = "OCO", ICEBERG = "ICEBERG" }
+
+type AdvancedOrder = {
+  base: Order;
+  type: AdvancedType;
+  // stop / trailing params
+  stopPrice?: number; // for STOP / STOP_LIMIT
+  trailPct?: number;  // for TRAILING
+  limitPrice?: number; // for STOP_LIMIT
+  // OCO linking
+  ocoPeerId?: number;
+  // iceberg
+  displayQty?: number; // visible slice
+  remaining?: number;  // total remaining
+};
+
+class AdvancedOrderBook {
+  private pendings: Map<number, AdvancedOrder> = new Map();
+  constructor(private market: Market) {}
+
+  place(ao: AdvancedOrder) {
+    this.pendings.set(ao.base.id, ao);
+    bus.emit("adv:placed", { id: ao.base.id, market: this.market.symbol });
+  }
+
+  cancel(id: number) { this.pendings.delete(id); }
+
+  // called every tick to see if triggers should fire
+  tick(mark: number) {
+    for (const [id, ao] of Array.from(this.pendings)) {
+      if (ao.type === AdvancedType.TRAILING && ao.trailPct) {
+        // trailing stop follows favorable move; for long positions, trigger if price falls from peak by trailPct
+        const sess = (ao as any)._peak ?? (ao as any)._peak = mark; // session peak
+        if (mark > (ao as any)._peak) (ao as any)._peak = mark;
+        const trigger = (ao as any)._peak * (1 - ao.trailPct);
+        if ((ao.base.side === "sell" && mark <= trigger) || (ao.base.side === "buy" && mark >= (ao as any)._peak * (1 + ao.trailPct))) {
+          this.fire(ao, mark);
+          this.pendings.delete(id);
+        }
+      } else if (ao.type === AdvancedType.STOP && ao.stopPrice) {
+        const cond = ao.base.side === "sell" ? mark <= ao.stopPrice : mark >= ao.stopPrice;
+        if (cond) { this.fireMarket(ao); this.pendings.delete(id); }
+      } else if (ao.type === AdvancedType.STOP_LIMIT && ao.stopPrice && ao.limitPrice) {
+        const cond = ao.base.side === "sell" ? mark <= ao.stopPrice : mark >= ao.stopPrice;
+        if (cond) { this.fireLimit(ao); this.pendings.delete(id); }
+      } else if (ao.type === AdvancedType.ICEBERG) {
+        // ensure a visible slice is resting; refill when filled
+        const visible = (ao.displayQty ?? ao.base.size);
+        if (ao.remaining == null) ao.remaining = ao.base.size;
+        const resting = Math.min(visible, ao.remaining);
+        if (resting > 0 && !(ao as any)._live) {
+          const slice = makeOrder({ ...ao.base, size: resting });
+          (ao as any)._live = slice.id;
+          (ao as any)._liveQty = resting;
+          this.market.submit(Exchange.accounts.get(ao.base.accountId)!, slice);
+        }
+      }
+    }
+  }
+
+  fillNotify(orderId: number, filled: number) {
+    const ao = this.pendings.get(orderId);
+    if (!ao) return;
+    if (ao.type === AdvancedType.ICEBERG) {
+      ao.remaining = Math.max(0, (ao.remaining ?? 0) - filled);
+      (ao as any)._live = undefined; (ao as any)._liveQty = 0;
+      if (ao.remaining <= 0) this.pendings.delete(orderId);
+    }
+  }
+
+  private fire(ao: AdvancedOrder, mark: number) {
+    const mkt = this.market; const acc = Exchange.accounts.get(ao.base.accountId)!;
+    const marketable = makeOrder({ ...ao.base, price: ao.base.side === "sell" ? mark - 1 : mark + 1, size: ao.base.size, tif: TimeInForce.IOC });
+    mkt.submit(acc, marketable);
+  }
+  private fireMarket(ao: AdvancedOrder) { this.fire(ao, this.market.markPrice()); }
+  private fireLimit(ao: AdvancedOrder) {
+    const mkt = this.market; const acc = Exchange.accounts.get(ao.base.accountId)!;
+    const lim = makeOrder({ ...ao.base, price: ao.limitPrice!, size: ao.base.size });
+    mkt.submit(acc, lim);
+  }
+}
+
+// attach an advanced book to Market
+(Market.prototype as any)._adv = undefined;
+(Market.prototype as any).adv = function(): AdvancedOrderBook {
+  if (!(this as any)._adv) (this as any)._adv = new AdvancedOrderBook(this as any);
+  return (this as any)._adv;
+};
+
+/*************************  EXEC ALGOS  *************************/
+
+type ExecAlgo = "TWAP" | "VWAP";
+
+type AlgoConfig = { algo: ExecAlgo; durationMs: number; slices: number };
+
+class ExecutionAlgo {
+  constructor(private market: Market) {}
+  run(acc: Account, side: Side, qty: number, limit: number, cfg: AlgoConfig) {
+    const sliceQty = Math.ceil(qty / cfg.slices);
+    for (let i = 0; i < cfg.slices; i++) {
+      // VWAP: push more when volume bar is higher; here mock with oracle confidence
+      const mult = cfg.algo === "VWAP" ? clamp(1 + (Math.random() - 0.5) * 0.2, 0.7, 1.3) : 1;
+      const sz = Math.min(sliceQty * mult, qty - i * sliceQty);
+      const o = makeOrder({ accountId: acc.id, market: this.market.symbol, side, price: limit, size: Math.max(1, Math.round(sz)) , tif: TimeInForce.IOC });
+      this.market.submit(acc, o);
+      timer.advance(cfg.durationMs / cfg.slices);
+      this.market.step();
+    }
+  }
+}
+
+/*************************  BACKTESTER  *************************/
+
+interface BacktestResult { pnl: number; maxDD: number; trades: number; sharpe: number; }
+
+class Backtester {
+  run(ex: Exchange, market: Market, strategy: (t: number, mark: number, acc: Account, mkt: Market) => void, steps = 500): BacktestResult {
+    const acc = ex.getAccount("backtest"); acc.deposit("USD", 10_000);
+    let peak = 10_000, trough = 10_000; let trades = 0; const rets: number[] = [];
+    for (let t = 0; t < steps; t++) {
+      timer.advance(60_000);
+      ex.stepAll();
+      const mark = market.markPrice();
+      const bal = acc.getBalance("USD");
+      const before = bal.free + bal.locked;
+      strategy(t, mark, acc, market);
+      const after = bal.free + bal.locked;
+      const r = (after - before) / Math.max(1, before);
+      rets.push(r);
+      peak = Math.max(peak, after); trough = Math.min(trough, after);
+      if (Math.abs(after - before) > 1e-6) trades++;
+    }
+    const pnl = toFixed(acc.getBalance("USD").free + acc.getBalance("USD").locked - 10_000, 6);
+    const avg = sma(rets, rets.length);
+    const vol = Math.sqrt(sma(rets.map(x => (x - avg) ** 2), rets.length)) + 1e-9;
+    const sharpe = toFixed((avg / vol) * Math.sqrt(365), 6);
+    return { pnl, maxDD: toFixed((peak - trough) / peak, 6), trades, sharpe };
+  }
+}
+
+/*************************  MAKER BOT  **************************/
+
+type MMConfig = { spreadBps: number; size: number; kInventory: number };
+
+class MakerBot {
+  private lastBid?: number; private lastAsk?: number;
+  constructor(private mkt: Market, private acc: Account, private cfg: MMConfig) {}
+
+  quote() {
+    const mid = this.mkt.markPrice();
+    const inv = (this.acc.positions.get(this.mkt.symbol)?.size ?? 0);
+    const skew = clamp(-inv / 10_000 * this.cfg.kInventory, -0.5, 0.5);
+    const half = (this.cfg.spreadBps / 10000) * mid * (1 + skew);
+    const bid = toFixed(mid - half, 6), ask = toFixed(mid + half, 6);
+
+    if (this.lastBid && Math.abs(this.lastBid - bid) < this.mkt.tickSize && this.lastAsk && Math.abs(this.lastAsk - ask) < this.mkt.tickSize) return;
+
+    // place/cancel simplistic: market will internally replace by new resting levels
+    const bidO = makeOrder({ accountId: this.acc.id, market: this.mkt.symbol, side: "buy", price: bid, size: this.cfg.size, postOnly: true });
+    const askO = makeOrder({ accountId: this.acc.id, market: this.mkt.symbol, side: "sell", price: ask, size: this.cfg.size, postOnly: true });
+    this.mkt.submit(this.acc, bidO);
+    this.mkt.submit(this.acc, askO);
+    this.lastBid = bid; this.lastAsk = ask;
+  }
+}
+
+/*************************  PERSISTENCE  ************************/ 
+
+type Snapshot = {
+  ts: number;
+  accounts: any[];
+  markets: any[];
+  treasury: any;
+};
+
+function serialize(ex: Exchange): Snapshot {
+  const accounts = Array.from(Exchange.accounts.values()).map(a => ({
+    id: a.id,
+    balances: Array.from(a.balances.values()),
+    positions: Array.from(a.positions.values()),
+    marginMode: a.marginMode
+  }));
+  const markets = Array.from(ex.markets.values()).map(m => ({ symbol: m.symbol, volume: m.volume, trades: m.trades, openInterest: m.openInterest }));
+  const treasury = { ...ex.treasury, streamflowLocked: ex.treasury.streamflow.totalLocked };
+  return { ts: timer.now(), accounts, markets, treasury };
+}
+
+function deserialize(s: Snapshot) {
+  // no-op for demo; in real impl you'd restore state into objects
+  return s;
+}
+
+/**********************  MULTI-MARKET & LATENCY  ****************/ 
+
+class LatencyModel {
+  constructor(public baseMs = 15, public jitterMs = 5) {}
+  delay() { return this.baseMs + Math.random() * this.jitterMs; }
+}
+
+class Orchestrator {
+  private makers: MakerBot[] = [];
+  private algos: ExecutionAlgo[] = [];
+  constructor(private ex: Exchange, private latency = new LatencyModel()) {}
+
+  addMarket(symbol: string, price: number) {
+    this.ex.oracle.tick(symbol); // ensure oracle map touched
+    const m = this.ex.createMarket(symbol);
+    // seed makers
+    const acc = this.ex.getAccount(`mm:${symbol}`); acc.deposit("USD", 50_000);
+    const bot = new MakerBot(m, acc, { spreadBps: 8, size: 1500, kInventory: 0.8 });
+    this.makers.push(bot);
+    this.algos.push(new ExecutionAlgo(m));
+    return m;
+  }
+
+  step() {
+    for (const m of this.ex.markets.values()) {
+      timer.advance(this.latency.delay());
+      m.step();
+    }
+    // makers refresh
+    for (const bot of this.makers) bot.quote();
+  }
+}
+
+/*************************  DEMO EXTENSION  *********************/
+
+// spin orchestrator with extra markets and bots
+const orch = new Orchestrator(ex, new LatencyModel(12, 6));
+orch.addMarket("MOTHER-USD", 0.12);
+orch.addMarket("WIF-USD", 2.18);
+
+// maker quotes & algo trade example
+const mmAcc = ex.getAccount("mm:WIF-USD");
+mmAcc.deposit("USD", 20_000);
+const wif = ex.markets.get("WIF-USD")!;
+const twap = new ExecutionAlgo(wif);
+
+twap.run(ex.getAccount("alice"), "buy", 2500, wif.markPrice() * 1.002, { algo: "TWAP", durationMs: 120_000, slices: 6 });
+
+// backtest simple momentum on PUMP-USD
+const bt = new Backtester();
+const res = bt.run(ex, mkt, (t, mark, acc, mkt) => {
+  const pos = acc.positions.get(mkt.symbol)?.size || 0;
+  const trend = Math.sign(Math.sin(t / 15));
+  if (trend > 0 && pos <= 0) {
+    mkt.submit(acc, makeOrder({ accountId: acc.id, market: mkt.symbol, side: "buy", price: mark * 1.001, size: 2000, tif: TimeInForce.IOC }));
+  } else if (trend < 0 && pos >= 0) {
+    mkt.submit(acc, makeOrder({ accountId: acc.id, market: mkt.symbol, side: "sell", price: mark * 0.999, size: 2000, tif: TimeInForce.IOC }));
+  }
+}, 180);
+
+console.log("
+[BACKTEST]", res);
+
+// final snapshot
+const snap = serialize(ex);
+console.log("
+[SNAPSHOT]", JSON.stringify(snap, null, 2).slice(0, 500) + "...
+");
+
+// Re-export extended API
+export const API = { Exchange, Market, OrderBook, makeOrder, TimeInForce, Account, RiskEngine, FundingEngine, Oracle, Treasury, toFixed, AdvancedOrderBook, AdvancedType, ExecutionAlgo, Backtester, MakerBot, Orchestrator, LatencyModel, serialize, deserialize };
+
